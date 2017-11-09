@@ -1,9 +1,40 @@
+buildscript {
+    repositories {
+        mavenLocal()
+        jcenter()
+    }
+    dependencies {
+        classpath "de.dfki.mary:gradle-marytts-crossvalidation-plugin:0.1-SNAPSHOT"
+        classpath "org.m2ci.msp:jtgt:0.5.3"
+    }
+}
+
 plugins {
     id 'de.dfki.mary.voicebuilding-base' version '5.2.2'
+    id 'de.dfki.mary.voicebuilding-festvox' version '5.2.2'
 }
 
 group 'de.dfki.mary'
 version '5.3-SNAPSHOT'
+
+apply plugin: 'de.dfki.mary.voicebuilding.marytts-crossvalidation'
+
+repositories {
+    ivy {
+        url 'http://mary.dfki.de/repo'
+        layout 'maven'
+    }
+    ivy {
+        url 'http://festvox.org/cmu_arctic/cmu_arctic/packed/'
+        layout 'pattern', {
+            artifact '[module]-[revision]-[classifier].[ext]'
+        }
+    }
+}
+
+dependencies {
+    data group: 'org.festvox', name: 'cmu_us_rms_arctic', version: '0.95', classifier: 'release', ext: 'tar.bz2'
+}
 
 voice {
     name = 'cmu-rms-hsmm'
@@ -20,13 +51,43 @@ voice {
     samplingRate = 16000
 }
 
+import groovy.json.JsonBuilder
+import groovy.json.JsonSlurper
+import static groovy.json.JsonOutput.*
+import org.m2ci.msp.jtgt.io.*
+
+task initParamFile {
+    ext.paramFile = project.file("$projectDir/parameters/beta.lst")
+    doFirst {
+        if (!paramFile.exists()) {
+            paramFile.getParentFile().mkdirs()
+        }
+    }
+    doLast {
+        0.0.step(1.1, 0.1) {
+            paramFile << "$it\n"
+        }
+    }
+    outputs.upToDateWhen {
+        true
+    }
+}
+
+
 afterEvaluate {
     generateVoiceConfig {
+        dependsOn initParamFile
+        ext.betaParam = getParameter(initParamFile.paramFile)
+
+        if (generateVoiceConfig.destFile.exists()) {
+            generateVoiceConfig.destFile.delete()
+            generateVoiceConfig.destFile.createNewFile()
+        }
         config << [
                 alpha               : 0.42,
                 gamma               : 0,
                 logGain             : false,
-                beta                : 0,
+                beta                : betaParam,
                 Ftd                 : 'jar:/marytts/voice/CmuRmsHsmm/tree-dur.inf',
                 Ftf                 : 'jar:/marytts/voice/CmuRmsHsmm/tree-lf0.inf',
                 Ftm                 : 'jar:/marytts/voice/CmuRmsHsmm/tree-mgc.inf',
@@ -53,5 +114,178 @@ afterEvaluate {
                 'F0.model'          : 'hmm',
                 'F0.attribute'      : 'f0'
         ]
+    }
+}
+
+void updateParamFile(File paramFile, String beta) {
+    def paramList = paramFile as String[]
+    if (paramFile.exists()) {
+        paramFile.delete()
+        paramFile.createNewFile()
+    }
+    paramList.each {
+        if(Double.parseDouble(it) != Double.parseDouble(beta)) {
+            paramFile.append("${Double.parseDouble(it)}\n")
+        }
+    }
+}
+
+double getParameter(File paramFile) {
+    if (paramFile.length() > 0) {
+        def paramList = paramFile as String[]
+        def beta = paramList.getAt(0)
+        return Double.parseDouble(beta)
+    } else {
+        double randomBeta = (Math.random() * 1.0).round(1)
+        return randomBeta
+    }
+}
+
+task createCrossvalidationListForHSMM {
+    dependsOn wav, lab, text
+    ext.cvDir = project.file("$buildDir/crossvalidation")
+    doLast {
+        cvDir.mkdirs()
+        ext.cvFile = project.file("$cvDir/crossvalidation.lst")
+        cvFile.withWriter { cvList ->
+            fileTree(wav.destDir).include('*.wav').collect {
+                it.name - '.wav'
+            }.minus([
+                    'arctic_a0438',
+                    'arctic_a0439',
+                    'arctic_b0391'
+            ]).each {
+                cvList.writeLine it
+            }
+        }
+    }
+}
+
+generateCrossvalidationInputFiles {
+    dependsOn createCrossvalidationListForHSMM
+}
+
+void saveVoiceConfig(String timestamp, File voiceConfig) {
+    def paramDir = project.file("${createCrossvalidationListForHSMM.cvDir}/parameters")
+    if (!paramDir.exists()) {
+        paramDir.mkdirs()
+    }
+    def timestampConfig = project.file("$paramDir/voice-${timestamp}.config")
+    timestampConfig.text = voiceConfig.text
+}
+
+moveReferenceFiles {
+    dependsOn generateCrossvalidationInputFiles
+    ext.refDir = moveReferenceFiles.refDir
+}
+
+synthesizeCrossvalidationAudio {
+    dependsOn generateCrossvalidationInputFiles
+    ext.outputDir = synthesizeCrossvalidationAudio.destDir
+}
+
+getRealisedDurations {
+    dependsOn synthesizeCrossvalidationAudio
+    ext.outputDir = getRealisedDurations.destDir
+}
+
+
+runCrossvalidation {
+    dependsOn moveReferenceFiles, getRealisedDurations, generateVoiceConfig, synthesizeCrossvalidationAudio
+    ext.outputFile = runCrossvalidation.outputFile
+    ext.timestamp = runCrossvalidation.timestamp
+    ext.resultsDir = project.file("results")
+    if (!(resultsDir.exists())) {
+        resultsDir.mkdirs()
+    }
+    doLast {
+        def beta = generateVoiceConfig.betaParam
+        updateParamFile(initParamFile.paramFile, beta.toString())
+        saveVoiceConfig(timestamp, generateVoiceConfig.destFile)
+        createPlottingData(timestamp, beta, resultsDir)
+        file(synthesizeCrossvalidationAudio.outputDir).renameTo("$createCrossvalidationListForHSMM.cvDir/output-$timestamp")
+    }
+}
+
+Map retrieveDurations(File labFile) {
+    def map = [:]
+    def xLabSer = new XWaveLabelSerializer()
+    def tg = xLabSer.fromString(labFile.text)
+    def nbPhones = 0
+    def length = 0
+    tg.tiers.find { it.name == 'phones' }.annotations.each {
+        // exclude the silences
+        if (it.getText() != "_") {
+            nbPhones++
+            length += it.getEnd() - it.getStart()
+        }
+    }
+    map.put("nbPhones", nbPhones)
+    map.put("length", length)
+    return map
+}
+
+void createPlottingData(String timestamp, Double beta, File resultsDir) {
+    def jsonFile = project.file("$resultsDir/results-${timestamp}.json")
+    if (!(jsonFile.exists())) {
+        jsonFile.createNewFile()
+    }
+    def rmslsfResults = project.file("$buildDir/crossvalidation/rmslsfdistortion-results-${timestamp}.txt")
+    def json = []
+    def xLabSer = new XWaveLabelSerializer()
+    rmslsfResults.eachLine { line, count ->
+        if (!(count == 1)) {
+            line.splitEachLine(' ') { items ->
+                if (!items[0].equals("Global")) {
+                    def refFile = project.file("${moveReferenceFiles.refDir}/${items[0]}.lab")
+                    def synthFile = project.file("${getRealisedDurations.outputDir}/${items[0]}.lab")
+                    def refMap = retrieveDurations(refFile)
+                    def synthMap = retrieveDurations(synthFile)
+                    json <<
+                            ["filename"            : items[0],
+                             "Beta"                : beta,
+                             "mean"                : Double.parseDouble(items[2]),
+                             "stddev"              : Double.parseDouble(items[4]),
+                             "nbPhones_original"   : refMap.get("nbPhones"),
+                             "nbPhones_synthesized": synthMap.get("nbPhones"),
+                             "length_original"     : refMap.get("length"),
+                             "length_synthesized"  : synthMap.get("length")
+                            ]
+                } else {
+                    json <<
+                            ["Global mean": Double.parseDouble(items[2]),
+                             "Beta"       : beta]
+                }
+            }
+        }
+        jsonFile.text = new JsonBuilder(json).toPrettyString()
+    }
+}
+
+task compareResults {
+    ext.globalComparison = new File("${runCrossvalidation.resultsDir}/globalComparison.json")
+    def map = [:]
+    fileTree(runCrossvalidation.resultsDir).include("results-*.json").collect { jsonFile ->
+        def timestamp = jsonFile.name - "results-" - ".json"
+        def json = new JsonSlurper().parseText(jsonFile.text)
+        json.each {
+            if (!it."Global mean".equals(null)) {
+                def globalMean = it."Global mean"
+                def beta = it.Beta
+                def valueMap = ["Global mean": it."Global mean", "Timestamp": timestamp]
+                map.put(beta, valueMap)
+            }
+        }
+    }
+
+    doLast {
+        def sorted = map.sort { it.value.get("Global mean") }
+        println("BEST BETA VALUE:\n")
+        def globalJson = prettyPrint(toJson(sorted))
+        println(globalJson)
+        globalComparison.text = prettyPrint(globalJson)
+    }
+    outputs.upToDateWhen {
+        false
     }
 }
