@@ -4,9 +4,6 @@ plugins {
     id 'de.dfki.mary.voicebuilding.marytts-crossvalidation' version '0.1'
 }
 
-group 'de.dfki.mary'
-version '5.3-SNAPSHOT'
-
 repositories {
     ivy {
         url 'http://mary.dfki.de/repo'
