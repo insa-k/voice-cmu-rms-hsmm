@@ -1,23 +1,11 @@
-buildscript {
-    repositories {
-        mavenLocal()
-        jcenter()
-    }
-    dependencies {
-        classpath "de.dfki.mary:gradle-marytts-crossvalidation-plugin:0.1-SNAPSHOT"
-        classpath "org.m2ci.msp:jtgt:0.5.3"
-    }
-}
-
 plugins {
     id 'de.dfki.mary.voicebuilding-base' version '5.2.2'
     id 'de.dfki.mary.voicebuilding-festvox' version '5.2.2'
+    id 'de.dfki.mary.voicebuilding.marytts-crossvalidation' version '0.1'
 }
 
 group 'de.dfki.mary'
 version '5.3-SNAPSHOT'
-
-apply plugin: 'de.dfki.mary.voicebuilding.marytts-crossvalidation'
 
 repositories {
     ivy {
@@ -30,10 +18,12 @@ repositories {
             artifact '[module]-[revision]-[classifier].[ext]'
         }
     }
+    jcenter()
 }
 
 dependencies {
     data group: 'org.festvox', name: 'cmu_us_rms_arctic', version: '0.95', classifier: 'release', ext: 'tar.bz2'
+    compile group: 'org.m2ci.msp', name:'jtgt', version: '0.5.3'
 }
 
 voice {
